@@ -1,3 +1,6 @@
+mod sock5_proxy;
+
+use sock5_proxy::Sock5Proxy;
 use base64::{self, read};
 use hyper::{Client, Request};
 use std::fs::File;
@@ -7,9 +10,11 @@ use std::process;
 use std::str::FromStr;
 use std::vec;
 
-fn main() {
-    get();
-    println!("Hello, world!");
+#[tokio::main]
+async fn main() {
+    let proxy = Sock5Proxy::new();
+
+    proxy.start().await;
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
