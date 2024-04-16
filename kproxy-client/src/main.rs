@@ -1,4 +1,6 @@
 use kproxy_core::{conn::MessageCodec, message};
+use std::collections::HashMap;
+use std::rc::Rc;
 fn main() {
     info!("hello");
     println!("Hello, world!");
@@ -16,21 +18,24 @@ struct ClientOpt {
 }
 
 struct Client {
-    opt: ClientOpt,
+    opt: Rc<ClientOpt>,
     device_id: u64,
     sock: TcpStream,
+
+    tunnels: HashMap<u64, Tunnel>,
 }
 
 impl Client {
-    pub async fn new(opt: ClientOpt) -> Result<Client, Box<dyn std::error::Error>> {
+    pub async fn new(opt: Rc<ClientOpt>) -> Result<Client, Box<dyn std::error::Error>> {
         let mut sock = TcpStream::connect(opt.server_addr.clone()).await?;
 
-        let device_id = auth(&mut sock, opt.device_token).await?;
+        let device_id = auth(&mut sock, opt.device_token.clone()).await?;
 
         let cli = Client {
-            opt,
+            opt: opt,
             device_id,
             sock,
+            tunnels: HashMap::new(),
         };
 
         return Ok(cli);
@@ -59,9 +64,27 @@ impl Client {
         addr: String,
         port: u16,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        
+        if let Some(_) = self.tunnels.get(&tunnel_id) {}
+
         Ok(())
     }
+}
+
+trait Tunnel {
+    
+}
+
+struct InPointTunnel {
+    tunnal_id: u64,
+    addr: String,
+    port: u16,
+    conns: HashMap<u64, TunnelConection>,
+}
+
+struct TunnelConection {
+    conn_id: u64,
+    local_stream: TcpStream,
+    remote_stream: TcpStream,
 }
 
 async fn auth<T>(stream: &mut T, device_token: String) -> Result<u64, Box<dyn std::error::Error>>
