@@ -215,6 +215,7 @@ async fn handle_client(
                         let mut c = conns.lock().await;
                         c.remove(&conn_id);
                     }
+                    info!("Connection {} closed (remote read ended)", conn_id);
                     let close_frame = Frame {
                         frame_type: FrameType::CloseConnection,
                         conn_id,
@@ -231,6 +232,7 @@ async fn handle_client(
                         warn!("Write to connection {} error: {}", conn_id, e);
                         conns.remove(&conn_id);
                         drop(conns);
+                        info!("Connection {} closed (write error)", conn_id);
                         let close_frame = Frame {
                             frame_type: FrameType::CloseConnection,
                             conn_id,
@@ -241,6 +243,7 @@ async fn handle_client(
                 }
             }
             FrameType::CloseConnection => {
+                info!("Connection {} closed by client", frame.conn_id);
                 let mut conns = connections.lock().await;
                 conns.remove(&frame.conn_id);
             }

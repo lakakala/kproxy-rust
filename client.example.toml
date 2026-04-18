@@ -5,10 +5,6 @@ server_addr = "107.175.140.21:8081"
 local_addr = "0.0.0.0:2222"
 remote_addr = "127.0.0.1:22"
 
-[[forwards]]
-local_addr = "0.0.0.0:3306"
-remote_addr = "127.0.0.1:3306"
-
 # Optional: connect to server via SOCKS5 proxy
 # [socks5]
 # addr = "127.0.0.1:1080"

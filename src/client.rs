@@ -210,6 +210,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                                 let mut c = r_conns.lock().await;
                                 c.remove(&conn_id);
                             }
+                            info!("Connection {} closed (local read ended)", conn_id);
                             let close_frame = Frame {
                                 frame_type: FrameType::CloseConnection,
                                 conn_id,
@@ -256,6 +257,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                         warn!("Write to local connection {} error: {}", conn_id, e);
                         conns.remove(&conn_id);
                         drop(conns);
+                        info!("Connection {} closed (write error)", conn_id);
                         let close_frame = Frame {
                             frame_type: FrameType::CloseConnection,
                             conn_id,
@@ -266,6 +268,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                 }
             }
             FrameType::CloseConnection => {
+                info!("Connection {} closed by server", frame.conn_id);
                 let mut conns = connections.lock().await;
                 conns.remove(&frame.conn_id);
             }
