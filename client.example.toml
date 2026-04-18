@@ -1,0 +1,16 @@
+token = "my-secret-token"
+server_addr = "server.example.com:8080"
+
+[[forwards]]
+local_addr = "127.0.0.1:3000"
+remote_addr = "0.0.0.0:9000"
+
+[[forwards]]
+local_addr = "127.0.0.1:3306"
+remote_addr = "0.0.0.0:13306"
+
+# Optional: connect to server via SOCKS5 proxy
+# [socks5]
+# addr = "127.0.0.1:1080"
+# username = "user"
+# password = "pass"
