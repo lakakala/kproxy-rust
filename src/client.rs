@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
@@ -76,7 +77,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         }
     });
 
-    let mut forward_map: HashMap<u32, String> = HashMap::new();
+    let mut forward_map: HashMap<u32, (String, u32)> = HashMap::new();
 
     for forward in &config.forwards {
         let register_frame = Frame {
@@ -109,7 +110,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                 result_frame.data[3],
                 result_frame.data[4],
             ]);
-            forward_map.insert(forward_id, forward.local_addr.clone());
+            forward_map.insert(forward_id, (forward.local_addr.clone(), 0));
             info!(
                 "Registered forward: {} -> {} (id={})",
                 forward.local_addr, forward.remote_addr, forward_id
@@ -127,6 +128,107 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
 
     let connections: Arc<Mutex<HashMap<u32, tokio::io::WriteHalf<TcpStream>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let next_conn_id: Arc<AtomicU32> = Arc::new(AtomicU32::new(1));
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (&forward_id, (local_addr, _)) in &forward_map {
+        let listener = match TcpListener::bind(local_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to bind listener on {}: {}",
+                    local_addr,
+                    e
+                ));
+            }
+        };
+        info!("Listening on {} for forward {}", local_addr, forward_id);
+
+        let tx = writer_tx.clone();
+        let conns = connections.clone();
+        let nid = next_conn_id.clone();
+        let l_key = key;
+        let l_forward_id = forward_id;
+
+        tasks.spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!(
+                            "New connection on forward {}: {}",
+                            l_forward_id, addr
+                        );
+
+                        let conn_id = nid.fetch_add(1, Ordering::Relaxed);
+
+                        let _ = stream.set_nodelay(true);
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        {
+                            let mut c = conns.lock().await;
+                            c.insert(conn_id, write_half);
+                        }
+
+                        let mut data = vec![0x00];
+                        data.extend_from_slice(&l_forward_id.to_be_bytes());
+                        let frame = Frame {
+                            frame_type: FrameType::NewConnection,
+                            conn_id,
+                            data,
+                        };
+                        if protocol::send_frame(&tx, &l_key, &frame).is_err() {
+                            let mut c = conns.lock().await;
+                            c.remove(&conn_id);
+                            continue;
+                        }
+
+                        let r_tx = tx.clone();
+                        let r_conns = conns.clone();
+                        let r_key = l_key;
+
+                        tokio::spawn(async move {
+                            let mut reader = read_half;
+                            let mut buf = vec![0u8; 32768];
+                            loop {
+                                match reader.read(&mut buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        let frame = Frame {
+                                            frame_type: FrameType::Data,
+                                            conn_id,
+                                            data: buf[..n].to_vec(),
+                                        };
+                                        if protocol::send_frame(&r_tx, &r_key, &frame).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            {
+                                let mut c = r_conns.lock().await;
+                                c.remove(&conn_id);
+                            }
+                            let close_frame = Frame {
+                                frame_type: FrameType::CloseConnection,
+                                conn_id,
+                                data: vec![],
+                            };
+                            let _ = protocol::send_frame(&r_tx, &r_key, &close_frame);
+                        });
+                    }
+                    Err(e) => {
+                        error!(
+                            "Accept error on forward {}: {}",
+                            l_forward_id, e
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         let frame = match protocol::read_frame(&mut reader, &key).await {
@@ -146,92 +248,6 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         };
 
         match frame.frame_type {
-            FrameType::NewConnection => {
-                if frame.data.len() < 5 {
-                    warn!("Invalid NewConnection frame");
-                    continue;
-                }
-                let forward_id = u32::from_be_bytes([
-                    frame.data[1],
-                    frame.data[2],
-                    frame.data[3],
-                    frame.data[4],
-                ]);
-                let conn_id = frame.conn_id;
-
-                let local_addr = match forward_map.get(&forward_id) {
-                    Some(addr) => addr.clone(),
-                    None => {
-                        warn!("Unknown forward id: {}", forward_id);
-                        let close_frame = Frame {
-                            frame_type: FrameType::CloseConnection,
-                            conn_id,
-                            data: vec![],
-                        };
-                        let _ = protocol::send_frame(&writer_tx, &key, &close_frame);
-                        continue;
-                    }
-                };
-
-                let local_stream = match TcpStream::connect(&local_addr).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Failed to connect to {}: {}", local_addr, e);
-                        let close_frame = Frame {
-                            frame_type: FrameType::CloseConnection,
-                            conn_id,
-                            data: vec![],
-                        };
-                        let _ = protocol::send_frame(&writer_tx, &key, &close_frame);
-                        continue;
-                    }
-                };
-
-                local_stream.set_nodelay(true)?;
-                info!("Connected to {} for connection {}", local_addr, conn_id);
-
-                let (read_half, write_half) = tokio::io::split(local_stream);
-                {
-                    let mut conns = connections.lock().await;
-                    conns.insert(conn_id, write_half);
-                }
-
-                let tx = writer_tx.clone();
-                let conns = connections.clone();
-                let r_key = key;
-
-                tokio::spawn(async move {
-                    let mut reader = read_half;
-                    let mut buf = vec![0u8; 32768];
-                    loop {
-                        match reader.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let frame = Frame {
-                                    frame_type: FrameType::Data,
-                                    conn_id,
-                                    data: buf[..n].to_vec(),
-                                };
-                                if protocol::send_frame(&tx, &r_key, &frame).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    {
-                        let mut c = conns.lock().await;
-                        c.remove(&conn_id);
-                    }
-                    let close_frame = Frame {
-                        frame_type: FrameType::CloseConnection,
-                        conn_id,
-                        data: vec![],
-                    };
-                    let _ = protocol::send_frame(&tx, &r_key, &close_frame);
-                });
-            }
             FrameType::Data => {
                 let conn_id = frame.conn_id;
                 let mut conns = connections.lock().await;
@@ -261,6 +277,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
 
     drop(writer_tx);
     writer_handle.abort();
+    tasks.abort_all();
 
     Ok(())
 }
