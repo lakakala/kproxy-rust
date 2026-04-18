@@ -1,4 +1,4 @@
-token = "my-secret-token"
+token = "d17d4d86-bc28-4464-b91d-3c57c1dc6d62"
 server_addr = "107.175.140.21:8081"
 
 [[forwards]]
