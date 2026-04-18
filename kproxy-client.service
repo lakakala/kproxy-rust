@@ -1,0 +1,13 @@
+[Unit]
+Description=KProxy Client
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/kproxy-rust/kproxy-rust client --config /opt/kproxy-rust/client.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
