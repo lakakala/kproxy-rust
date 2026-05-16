@@ -1,6 +1,15 @@
+//! 最小 SOCKS5 客户端，用于 kproxy 客户端需要通过上游代理连接服务端的场景。
+//!
+//! 这里只实现 CONNECT 命令，并解析 IPv4/IPv6/域名三种响应地址类型。
+//! 目标地址按域名形式发送，因为调用方已经从配置的服务端地址中拆出了 host。
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// 通过 `proxy_addr` 打开到 `target_addr:target_port` 的 TCP 流。
+///
+/// 只有用户名和密码同时提供时，才会向代理声明支持用户名/密码认证。
+/// 成功后返回的流就是代理后的连接，可以像普通 `TcpStream` 一样使用。
 pub async fn connect(
     proxy_addr: &str,
     target_addr: &str,
@@ -13,6 +22,8 @@ pub async fn connect(
 
     let has_auth = username.is_some() && password.is_some();
 
+    // Greeting：SOCKS 版本 5、支持的认证方法数量、认证方法 ID。
+    // 这里支持“无需认证”和“用户名/密码”两种方式。
     if has_auth {
         stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
     } else {
@@ -23,12 +34,16 @@ pub async fn connect(
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting).await?;
     if greeting[0] != 0x05 {
-        return Err(anyhow::anyhow!("Invalid SOCKS5 version: 0x{:02x}", greeting[0]));
+        return Err(anyhow::anyhow!(
+            "Invalid SOCKS5 version: 0x{:02x}",
+            greeting[0]
+        ));
     }
 
     match greeting[1] {
         0x00 => {}
         0x02 => {
+            // RFC 1929 用户名/密码子协商。两个字段都是单字节长度前缀字符串。
             let user = username.unwrap_or("");
             let pass = password.unwrap_or("");
             if user.is_empty() || pass.is_empty() {
@@ -69,6 +84,7 @@ pub async fn connect(
         }
     }
 
+    // CONNECT 请求使用 ATYP=0x03（域名），由代理负责解析目标 host。
     let mut connect_req = Vec::with_capacity(1 + 1 + 1 + 1 + target_addr.len() + 2);
     connect_req.push(0x05);
     connect_req.push(0x01);
@@ -99,6 +115,8 @@ pub async fn connect(
         code => return Err(anyhow::anyhow!("SOCKS5: unknown error 0x{:02x}", code)),
     }
 
+    // 消费代理返回的 bind 地址。kproxy 不需要这个地址，但必须完整读掉，
+    // 这样后续读取才会从被代理的应用数据开始。
     match resp_header[3] {
         0x01 => {
             let mut buf = [0u8; 4 + 2];
@@ -116,7 +134,10 @@ pub async fn connect(
             stream.read_exact(&mut buf).await?;
         }
         atyp => {
-            return Err(anyhow::anyhow!("SOCKS5: unknown address type 0x{:02x}", atyp));
+            return Err(anyhow::anyhow!(
+                "SOCKS5: unknown address type 0x{:02x}",
+                atyp
+            ));
         }
     }
 
