@@ -15,20 +15,20 @@ use tracing::{error, info, warn};
 use crate::crypto;
 use crate::protocol::{self, Frame, FrameType};
 
-/// 每条连接独立保护的写半边。
-///
-/// socket 写锁按连接拆分，可以避免跨网络 I/O 持有全局 `ConnectionMap` 锁。
-type SharedWriteHalf = Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>;
-
 /// 活跃代理流表，按协议连接 ID 索引。
-type ConnectionMap = Arc<Mutex<HashMap<u32, SharedWriteHalf>>>;
+///
+/// 每条连接保存的是其独立写任务的入队 sender（见 [`protocol::spawn_conn_writer`]），
+/// 控制循环只入队、不直接 `await` 单条 socket 的写，从而避免单条慢连接拖垮整条
+/// 多路复用控制连接。
+type ConnectionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 /// 启动服务端监听，并为每个客户端控制连接启动处理任务。
 pub async fn run(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     info!("Server listening on {}", config.listen_addr);
 
-    let key = crypto::derive_key(&config.token);
+    // 构造一次可复用的 cipher 实例，所有客户端控制连接共享，避免每帧重建。
+    let cipher = Arc::new(crypto::new_cipher(&crypto::derive_key(&config.token)));
     let expected_token = config.token.clone();
 
     loop {
@@ -36,10 +36,11 @@ pub async fn run(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
         let (stream, addr) = listener.accept().await?;
         info!("New connection from {}", addr);
 
+        let cipher = cipher.clone();
         let token = expected_token.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, key, &token).await {
+            if let Err(e) = handle_client(stream, cipher, &token).await {
                 error!("Client handler error: {}", e);
             }
         });
@@ -48,7 +49,7 @@ pub async fn run(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
 
 async fn handle_client(
     stream: TcpStream,
-    key: [u8; 32],
+    cipher: Arc<crypto::Cipher>,
     expected_token: &str,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
@@ -56,7 +57,7 @@ async fn handle_client(
     let writer = Arc::new(Mutex::new(writer));
 
     // 第一帧必须完成客户端认证，认证通过前不接受任何转发状态。
-    let frame = protocol::read_frame(&mut reader, &key).await?;
+    let frame = protocol::read_frame(&mut reader, &cipher).await?;
     if !matches!(frame.frame_type, FrameType::Auth) {
         return Err(anyhow::anyhow!("Expected Auth frame"));
     }
@@ -69,7 +70,7 @@ async fn handle_client(
             data: b"auth failed".to_vec(),
         };
         let mut w = writer.lock().await;
-        protocol::write_frame(&mut *w, &key, &response).await?;
+        protocol::write_frame(&mut *w, &cipher, &response).await?;
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
@@ -82,7 +83,7 @@ async fn handle_client(
     };
     {
         let mut w = writer.lock().await;
-        protocol::write_frame(&mut *w, &key, &response).await?;
+        protocol::write_frame(&mut *w, &cipher, &response).await?;
     }
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(4096);
@@ -107,7 +108,7 @@ async fn handle_client(
     loop {
         // 主控制面循环。这里收到的帧可能修改转发元数据、创建/关闭代理流，
         // 或携带代理流数据。
-        let frame = match protocol::read_frame(&mut reader, &key).await {
+        let frame = match protocol::read_frame(&mut reader, &cipher).await {
             Ok(f) => f,
             Err(e) => {
                 let msg = e.to_string();
@@ -138,7 +139,7 @@ async fn handle_client(
                     conn_id: 0,
                     data,
                 };
-                let _ = protocol::send_frame(&writer_tx, &key, &response).await;
+                let _ = protocol::send_frame(&writer_tx, &cipher, &response).await;
             }
             FrameType::NewConnection => {
                 // 负载布局：状态/保留字节，后跟注册阶段分配的转发 ID（大端序）。
@@ -149,7 +150,7 @@ async fn handle_client(
                         conn_id: frame.conn_id,
                         data: vec![0x01],
                     };
-                    let _ = protocol::send_frame(&writer_tx, &key, &close_frame).await;
+                    let _ = protocol::send_frame(&writer_tx, &cipher, &close_frame).await;
                     continue;
                 }
                 let forward_id = u32::from_be_bytes([
@@ -169,7 +170,7 @@ async fn handle_client(
                             conn_id,
                             data: vec![0x01],
                         };
-                        let _ = protocol::send_frame(&writer_tx, &key, &close_frame).await;
+                        let _ = protocol::send_frame(&writer_tx, &cipher, &close_frame).await;
                         continue;
                     }
                 };
@@ -183,7 +184,7 @@ async fn handle_client(
                             conn_id,
                             data: vec![0x01],
                         };
-                        let _ = protocol::send_frame(&writer_tx, &key, &close_frame).await;
+                        let _ = protocol::send_frame(&writer_tx, &cipher, &close_frame).await;
                         continue;
                     }
                 };
@@ -191,17 +192,18 @@ async fn handle_client(
                 remote_stream.set_nodelay(true)?;
                 info!("Connected to {} for connection {}", remote_addr, conn_id);
 
-                // 保存写半边，这样后续来自客户端的 `Data` 帧可以写入这条
-                // 服务端侧 TCP 连接。
+                // 登记写队列，这样后续来自客户端的 `Data` 帧可以入队写入这条
+                // 服务端侧 TCP 连接。写出由独立任务处理，控制循环只入队、不阻塞。
                 let (read_half, write_half) = tokio::io::split(remote_stream);
                 {
+                    let data_tx = protocol::spawn_conn_writer(write_half);
                     let mut conns = connections.lock().await;
-                    conns.insert(conn_id, Arc::new(Mutex::new(write_half)));
+                    conns.insert(conn_id, data_tx);
                 }
 
                 let tx = writer_tx.clone();
                 let conns = connections.clone();
-                let r_key = key;
+                let r_cipher = cipher.clone();
 
                 tokio::spawn(async move {
                     // 服务端侧 TCP -> 加密控制连接。
@@ -217,7 +219,7 @@ async fn handle_client(
                                     conn_id,
                                     data: buf[..n].to_vec(),
                                 };
-                                if protocol::send_frame(&tx, &r_key, &frame).await.is_err() {
+                                if protocol::send_frame(&tx, &r_cipher, &frame).await.is_err() {
                                     break;
                                 }
                             }
@@ -235,35 +237,39 @@ async fn handle_client(
                         conn_id,
                         data: vec![],
                     };
-                    let _ = protocol::send_frame(&tx, &r_key, &close_frame).await;
+                    let _ = protocol::send_frame(&tx, &r_cipher, &close_frame).await;
                 });
             }
             FrameType::Data => {
                 // 加密控制连接 -> 服务端侧 TCP。
-                // 持有连接表锁时只克隆单连接 writer，随后释放连接表锁再等待网络 I/O。
+                // 持有连接表锁时只克隆单连接的写队列 sender，随后释放锁。
+                // 入队用 `try_send`：控制循环绝不因某条连接而阻塞。
                 let conn_id = frame.conn_id;
-                let write_half = {
+                let sender = {
                     let conns = connections.lock().await;
                     conns.get(&conn_id).cloned()
                 };
-                if let Some(write_half) = write_half {
-                    let mut write_half = write_half.lock().await;
-                    let Err(e) = write_half.write_all(&frame.data).await else {
+                if let Some(sender) = sender {
+                    // 入队成功即继续读下一帧。队列满（对端消费过慢）或已关闭时，
+                    // 关闭这一条连接，而不是拖垮整条多路复用控制连接。
+                    if sender.try_send(frame.data).is_ok() {
                         continue;
-                    };
+                    }
 
-                    warn!("Write to connection {} error: {}", conn_id, e);
                     {
                         let mut conns = connections.lock().await;
                         conns.remove(&conn_id);
                     }
-                    info!("Connection {} closed (write error)", conn_id);
+                    info!(
+                        "Connection {} closed (slow consumer / write queue full)",
+                        conn_id
+                    );
                     let close_frame = Frame {
                         frame_type: FrameType::CloseConnection,
                         conn_id,
                         data: vec![],
                     };
-                    let _ = protocol::send_frame(&writer_tx, &key, &close_frame).await;
+                    let _ = protocol::send_frame(&writer_tx, &cipher, &close_frame).await;
                 }
             }
             FrameType::CloseConnection => {

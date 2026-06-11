@@ -17,15 +17,18 @@ use crate::crypto;
 use crate::protocol::{self, Frame, FrameType};
 use crate::socks5;
 
-/// 每条本地连接独立保护的写半边。
-type SharedWriteHalf = Arc<Mutex<tokio::io::WriteHalf<TcpStream>>>;
-
 /// 活跃本地 TCP 流表，按协议连接 ID 索引。
-type ConnectionMap = Arc<Mutex<HashMap<u32, SharedWriteHalf>>>;
+///
+/// 每条连接保存的是其独立写任务的入队 sender（见 [`protocol::spawn_conn_writer`]），
+/// 而不是直接持有写半边。这样控制循环只入队、不阻塞，从而避免单条慢连接拖垮
+/// 整条多路复用控制连接。
+type ConnectionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 /// 连接服务端、注册转发规则，并运行本地监听器。
 pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
-    let key = crypto::derive_key(&config.token);
+    // 由 token 派生密钥后构造一个可复用的 cipher 实例，整条控制连接共用，
+    // 避免每帧重建 cipher 的 CPU 开销。`Arc` 用于在各 spawn 任务间共享。
+    let cipher = Arc::new(crypto::new_cipher(&crypto::derive_key(&config.token)));
 
     let stream = if let Some(socks5_config) = &config.socks5 {
         let (host, port) = parse_host_port(&config.server_addr)?;
@@ -59,10 +62,10 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
     };
     {
         let mut w = writer.lock().await;
-        protocol::write_frame(&mut *w, &key, &auth_frame).await?;
+        protocol::write_frame(&mut *w, &cipher, &auth_frame).await?;
     }
 
-    let auth_result = protocol::read_frame(&mut reader, &key).await?;
+    let auth_result = protocol::read_frame(&mut reader, &cipher).await?;
     if !matches!(auth_result.frame_type, FrameType::AuthResult) {
         return Err(anyhow::anyhow!("Expected AuthResult frame"));
     }
@@ -100,10 +103,10 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         };
         {
             let mut w = writer.lock().await;
-            protocol::write_frame(&mut *w, &key, &register_frame).await?;
+            protocol::write_frame(&mut *w, &cipher, &register_frame).await?;
         }
 
-        let result_frame = protocol::read_frame(&mut reader, &key).await?;
+        let result_frame = protocol::read_frame(&mut reader, &cipher).await?;
         if !matches!(result_frame.frame_type, FrameType::RegisterForwardResult) {
             return Err(anyhow::anyhow!("Expected RegisterForwardResult frame"));
         }
@@ -164,7 +167,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         let tx = writer_tx.clone();
         let conns = connections.clone();
         let nid = next_conn_id.clone();
-        let l_key = key;
+        let l_cipher = cipher.clone();
         let l_forward_id = forward_id;
 
         tasks.spawn(async move {
@@ -178,10 +181,12 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                         let _ = stream.set_nodelay(true);
                         let (read_half, write_half) = tokio::io::split(stream);
                         {
-                            // 先保存本地写半边，再通知服务端有新连接。
-                            // 这样服务端返回的数据一定有写入目标。
+                            // 先登记本地写队列，再通知服务端有新连接。
+                            // 这样服务端返回的数据一定有写入目标。写出由独立任务
+                            // 处理，控制循环只入队、不阻塞。
+                            let data_tx = protocol::spawn_conn_writer(write_half);
                             let mut c = conns.lock().await;
-                            c.insert(conn_id, Arc::new(Mutex::new(write_half)));
+                            c.insert(conn_id, data_tx);
                         }
 
                         // 负载布局与服务端解析逻辑一致：
@@ -193,7 +198,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                             conn_id,
                             data,
                         };
-                        if protocol::send_frame(&tx, &l_key, &frame).await.is_err() {
+                        if protocol::send_frame(&tx, &l_cipher, &frame).await.is_err() {
                             let mut c = conns.lock().await;
                             c.remove(&conn_id);
                             continue;
@@ -201,7 +206,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
 
                         let r_tx = tx.clone();
                         let r_conns = conns.clone();
-                        let r_key = l_key;
+                        let r_cipher = l_cipher.clone();
 
                         tokio::spawn(async move {
                             // 本地 TCP -> 加密控制连接。
@@ -217,7 +222,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                                             conn_id,
                                             data: buf[..n].to_vec(),
                                         };
-                                        if protocol::send_frame(&r_tx, &r_key, &frame)
+                                        if protocol::send_frame(&r_tx, &r_cipher, &frame)
                                             .await
                                             .is_err()
                                         {
@@ -238,7 +243,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                                 conn_id,
                                 data: vec![],
                             };
-                            let _ = protocol::send_frame(&r_tx, &r_key, &close_frame).await;
+                            let _ = protocol::send_frame(&r_tx, &r_cipher, &close_frame).await;
                         });
                     }
                     Err(e) => {
@@ -253,7 +258,7 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
     loop {
         // 服务端 -> 客户端的主控制循环。收到的 `Data` 帧会写入本地 socket；
         // 关闭帧会移除本地连接状态。
-        let frame = match protocol::read_frame(&mut reader, &key).await {
+        let frame = match protocol::read_frame(&mut reader, &cipher).await {
             Ok(f) => f,
             Err(e) => {
                 let msg = e.to_string();
@@ -268,31 +273,34 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
 
         match frame.frame_type {
             FrameType::Data => {
-                // 持有连接表锁时只克隆单连接 writer，随后释放连接表锁再等待
-                // socket 写入。
+                // 持有连接表锁时只克隆单连接的写队列 sender，随后释放锁。
+                // 入队用 `try_send`：控制循环绝不因某条连接而阻塞。
                 let conn_id = frame.conn_id;
-                let write_half = {
+                let sender = {
                     let conns = connections.lock().await;
                     conns.get(&conn_id).cloned()
                 };
-                if let Some(write_half) = write_half {
-                    let mut write_half = write_half.lock().await;
-                    let Err(e) = write_half.write_all(&frame.data).await else {
+                if let Some(sender) = sender {
+                    // 入队成功即继续读下一帧。队列满（对端消费过慢）或已关闭时，
+                    // 关闭这一条连接，而不是拖垮整条多路复用控制连接。
+                    if sender.try_send(frame.data).is_ok() {
                         continue;
-                    };
+                    }
 
-                    warn!("Write to local connection {} error: {}", conn_id, e);
                     {
                         let mut conns = connections.lock().await;
                         conns.remove(&conn_id);
                     }
-                    info!("Connection {} closed (write error)", conn_id);
+                    info!(
+                        "Connection {} closed (slow consumer / write queue full)",
+                        conn_id
+                    );
                     let close_frame = Frame {
                         frame_type: FrameType::CloseConnection,
                         conn_id,
                         data: vec![],
                     };
-                    let _ = protocol::send_frame(&writer_tx, &key, &close_frame).await;
+                    let _ = protocol::send_frame(&writer_tx, &cipher, &close_frame).await;
                 }
             }
             FrameType::CloseConnection => {

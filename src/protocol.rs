@@ -22,6 +22,8 @@
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::crypto::Cipher;
+
 /// 多路复用控制连接使用的帧类型。
 ///
 /// 这些数值是线上协议的一部分，修改它们会破坏已有客户端和服务端的兼容性。
@@ -105,11 +107,11 @@ impl Frame {
 /// 这用于同步初始化阶段，此时专用 writer 任务和有界通道还没有启动。
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    key: &[u8; 32],
+    cipher: &Cipher,
     frame: &Frame,
 ) -> Result<()> {
     let plaintext = frame.encode();
-    let encrypted = crate::crypto::encrypt(key, &plaintext)?;
+    let encrypted = crate::crypto::encrypt(cipher, &plaintext)?;
 
     let len = (encrypted.len() as u32).to_be_bytes();
     writer.write_all(&len).await?;
@@ -121,7 +123,7 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
 /// 从流中读取、解密并解码一帧。
 ///
 /// 64 MiB 限制用于避免对端通过恶意长度前缀触发无界内存分配。
-pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R, key: &[u8; 32]) -> Result<Frame> {
+pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R, cipher: &Cipher) -> Result<Frame> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -133,7 +135,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R, key: &[u8; 32])
     let mut encrypted = vec![0u8; len];
     reader.read_exact(&mut encrypted).await?;
 
-    let plaintext = crate::crypto::decrypt(key, &encrypted)?;
+    let plaintext = crate::crypto::decrypt(cipher, &encrypted)?;
     Frame::decode(&plaintext)
 }
 
@@ -143,11 +145,11 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R, key: &[u8; 32])
 /// 等待会形成背压，避免高负载下出现紧密的重试/关闭循环。
 pub async fn send_frame(
     tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    key: &[u8; 32],
+    cipher: &Cipher,
     frame: &Frame,
 ) -> Result<()> {
     let plaintext = frame.encode();
-    let encrypted = crate::crypto::encrypt(key, &plaintext)?;
+    let encrypted = crate::crypto::encrypt(cipher, &plaintext)?;
     let mut raw = Vec::with_capacity(4 + encrypted.len());
     raw.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
     raw.extend_from_slice(&encrypted);
@@ -155,4 +157,35 @@ pub async fn send_frame(
         .await
         .map_err(|e| anyhow::anyhow!("Channel send error: {}", e))?;
     Ok(())
+}
+
+/// 每条被代理连接的写队列容量（以帧为单位）。
+///
+/// 控制循环只向该队列入队，永不直接 `await` 单条 socket 的写。容量满意味着
+/// 这条连接的对端消费严重滞后；此时关闭该连接，而不是阻塞整条多路复用控制
+/// 连接（否则会引发队头阻塞，乃至双向大流量下的互锁）。
+pub const CONN_WRITE_QUEUE: usize = 256;
+
+/// 为一条代理连接启动独立的写任务，返回用于入队待写数据的 sender。
+///
+/// 过去控制循环在收到 `Data` 帧时会内联 `write_all` 到目标 socket，一旦该
+/// socket 因对端读得慢而背压，整条控制连接（连同复用其上的所有连接）都会
+/// 卡死。这里把每条连接的写出隔离到独立任务：控制循环只负责入队，绝不因
+/// 单条慢连接而停顿。
+///
+/// sender 被丢弃（连接从连接表移除）后，写任务会读到通道关闭并 `shutdown`
+/// socket 的写方向，从而回收半开连接。
+pub fn spawn_conn_writer(
+    mut write_half: tokio::io::WriteHalf<tokio::net::TcpStream>,
+) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(CONN_WRITE_QUEUE);
+    tokio::spawn(async move {
+        while let Some(data) = rx.recv().await {
+            if write_half.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = write_half.shutdown().await;
+    });
+    tx
 }

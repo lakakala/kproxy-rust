@@ -9,6 +9,11 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+/// 复用的 AES-256-GCM cipher 实例类型别名。
+///
+/// AES 密钥扩展只在 [`new_cipher`] 里做一次，之后每帧加解密复用同一实例。
+pub type Cipher = Aes256Gcm;
+
 /// 从共享 token 派生稳定的 32 字节 AES 密钥。
 ///
 /// 这里使用简单的 SHA-256 派生，而不是密码 KDF，因此 token 应当具备高熵。
@@ -21,14 +26,21 @@ pub fn derive_key(token: &str) -> [u8; 32] {
     key
 }
 
+/// 由密钥构造一个可复用的 AES-256-GCM cipher 实例。
+///
+/// AES 的密钥扩展（key schedule）较为昂贵，过去每加解密一帧都会重建一次
+/// cipher，在高吞吐下会显著消耗 CPU。这里只构造一次，连接的整个生命周期
+/// 内复用同一实例。
+pub fn new_cipher(key: &[u8; 32]) -> Cipher {
+    let cipher_key = Key::<Aes256Gcm>::from_slice(key);
+    Aes256Gcm::new(cipher_key)
+}
+
 /// 加密明文帧体，并返回 `nonce || ciphertext || tag`。
 ///
 /// AES-GCM 使用 12 字节 nonce，并在密文后追加 16 字节认证标签。
 /// 每一帧都会生成随机 nonce，以避免 nonce 重用。
-pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let cipher_key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(cipher_key);
-
+pub fn encrypt(cipher: &Cipher, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -47,16 +59,13 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// 输入必须包含 12 字节 nonce、密文以及 16 字节 GCM 标签。
 /// 认证失败会作为错误返回。
-pub fn decrypt(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt(cipher: &Cipher, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if data.len() < 12 + 16 {
         return Err(anyhow::anyhow!("Data too short for decryption"));
     }
 
     let nonce = Nonce::from_slice(&data[..12]);
     let ciphertext = &data[12..];
-
-    let cipher_key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(cipher_key);
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
