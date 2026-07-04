@@ -15,14 +15,32 @@
 //! 帧类型对应的负载字节
 //! ```
 //!
-//! `conn_id == 0` 保留给认证、转发注册等控制面消息。被代理的 TCP
-//! 流使用非零连接 ID，这样数据帧和关闭帧就可以在同一条加密控制连接上
-//! 完成多路复用和拆分。
+//! `conn_id == 0` 保留给认证、转发注册、心跳（`Ping`/`Pong`）等控制面消息。
+//! 被代理的 TCP 流使用非零连接 ID，这样数据帧和关闭帧就可以在同一条加密控制
+//! 连接上完成多路复用和拆分。
+
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::crypto::Cipher;
+
+/// 客户端发送 `Ping` 心跳的周期。
+///
+/// 该值远小于 [`HEARTBEAT_TIMEOUT`]：空闲时心跳流量保持 NAT/防火墙映射存活，
+/// 同时让任意一端能在数个心跳周期内发现对端已不可达。
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 控制连接读超时。任意收到的帧都会重置该窗口。
+///
+/// 约为 [`HEARTBEAT_INTERVAL`] 的三倍：需要连续丢失约 3 个心跳才判定断线，
+/// 因此短暂网络抖动不会触发误重连，而真正的死连接会在该时长内被发现。
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// 优雅关闭时等待积压数据 flush / 对端 `CloseConnection` 通知写出的最长时间，
+/// 超过该时长则放弃等待、强制退出，避免关闭过程被卡死的连接无限拖住。
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 多路复用控制连接使用的帧类型。
 ///
@@ -44,6 +62,10 @@ pub enum FrameType {
     Data = 0x06,
     /// 双向关闭信号，表示某条代理流应被关闭。
     CloseConnection = 0x07,
+    /// 控制连接心跳请求（`conn_id == 0`，无负载）。收到后对端应回 `Pong`。
+    Ping = 0x08,
+    /// 控制连接心跳应答（`conn_id == 0`，无负载）。
+    Pong = 0x09,
 }
 
 impl FrameType {
@@ -56,6 +78,8 @@ impl FrameType {
             0x05 => Some(FrameType::NewConnection),
             0x06 => Some(FrameType::Data),
             0x07 => Some(FrameType::CloseConnection),
+            0x08 => Some(FrameType::Ping),
+            0x09 => Some(FrameType::Pong),
             _ => None,
         }
     }

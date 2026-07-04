@@ -4,6 +4,7 @@
 //! 具体运行逻辑会交给对应模式的模块处理。
 
 use clap::{Parser, Subcommand};
+use tracing::info;
 
 mod client;
 mod config;
@@ -51,17 +52,55 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // 在进入所选运行模式之前加载对应配置。
+    // 关闭信号通过 watch 通道广播给运行循环及其所有子任务，使其能优雅收尾
+    // （flush 积压数据、通知对端关闭）后正常返回，而不是被进程强杀。
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    // 在进入所选运行模式之前加载对应配置。run 内部观察 shutdown 并自行 drain，
+    // drain 完成后返回，main 据此干净退出（退出码 0）。
     match cli.command {
         Commands::Server { config } => {
             let config = config::load_server_config(&config)?;
-            server::run(&config).await?;
+            server::run(&config, shutdown_rx).await?;
         }
         Commands::Client { config } => {
             let config = config::load_client_config(&config)?;
-            client::run(&config).await?;
+            client::run(&config, shutdown_rx).await?;
         }
     }
 
+    info!("Shutdown complete");
     Ok(())
+}
+
+/// 等待进程级关闭信号：SIGINT（Ctrl-C）或 SIGTERM。
+///
+/// 非 unix 平台只监听 Ctrl-C，SIGTERM 分支用永不就绪的 future 占位。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received; draining...");
 }

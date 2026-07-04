@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::crypto;
@@ -23,7 +24,13 @@ use crate::protocol::{self, Frame, FrameType};
 type ConnectionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 /// 启动服务端监听，并为每个客户端控制连接启动处理任务。
-pub async fn run(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
+///
+/// 收到关闭信号（`shutdown` 变为 `true`）后停止接受新连接，并给在途的客户端
+/// 处理任务一个有界 [`protocol::DRAIN_TIMEOUT`] 的优雅收尾时间后返回。
+pub async fn run(
+    config: &crate::config::ServerConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     info!("Server listening on {}", config.listen_addr);
 
@@ -31,26 +38,51 @@ pub async fn run(config: &crate::config::ServerConfig) -> anyhow::Result<()> {
     let cipher = Arc::new(crypto::new_cipher(&crypto::derive_key(&config.token)));
     let expected_token = config.token.clone();
 
+    // 追踪在途的客户端处理任务，便于关闭时做有界 drain。
+    let mut clients: JoinSet<()> = JoinSet::new();
+
     loop {
-        // `accept().await` 会在没有新控制连接时挂起任务，因此空闲时不会自旋。
-        let (stream, addr) = listener.accept().await?;
-        info!("New connection from {}", addr);
+        tokio::select! {
+            // `accept().await` 会在没有新控制连接时挂起任务，因此空闲时不会自旋。
+            accept = listener.accept() => {
+                let (stream, addr) = accept?;
+                info!("New connection from {}", addr);
 
-        let cipher = cipher.clone();
-        let token = expected_token.clone();
+                let cipher = cipher.clone();
+                let token = expected_token.clone();
+                let client_shutdown = shutdown.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, cipher, &token).await {
-                error!("Client handler error: {}", e);
+                clients.spawn(async move {
+                    if let Err(e) = handle_client(stream, cipher, &token, client_shutdown).await {
+                        error!("Client handler error: {}", e);
+                    }
+                });
             }
-        });
+            _ = shutdown.changed() => {
+                info!("Server shutting down; stop accepting new connections");
+                break;
+            }
+        }
     }
+
+    // 停止 accept 后，给在途客户端处理任务有界时间各自 drain 收尾。
+    let drained = tokio::time::timeout(protocol::DRAIN_TIMEOUT, async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        warn!("Drain timeout; aborting remaining client handlers");
+        clients.abort_all();
+    }
+
+    Ok(())
 }
 
 async fn handle_client(
     stream: TcpStream,
     cipher: Arc<crypto::Cipher>,
     expected_token: &str,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
     let (mut reader, writer) = tokio::io::split(stream);
@@ -108,15 +140,34 @@ async fn handle_client(
     loop {
         // 主控制面循环。这里收到的帧可能修改转发元数据、创建/关闭代理流，
         // 或携带代理流数据。
-        let frame = match protocol::read_frame(&mut reader, &cipher).await {
-            Ok(f) => f,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("unexpected eof") || msg.contains("EOF") || msg.contains("reset") {
-                    info!("Client disconnected");
-                } else {
-                    error!("Read frame error: {}", e);
+        // 读超时即视为客户端心跳丢失（连接已死或网络长时间不可达）。任意收到的帧
+        // 都会重置该窗口，因此正常心跳流量下不会触发。超时后退出处理任务，由客户端
+        // 自行重连建立新会话。
+        let frame = tokio::select! {
+            read = tokio::time::timeout(
+                protocol::HEARTBEAT_TIMEOUT,
+                protocol::read_frame(&mut reader, &cipher),
+            ) => match read {
+                Ok(Ok(f)) => f,
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    if msg.contains("unexpected eof")
+                        || msg.contains("EOF")
+                        || msg.contains("reset")
+                    {
+                        info!("Client disconnected");
+                    } else {
+                        error!("Read frame error: {}", e);
+                    }
+                    break;
                 }
+                Err(_) => {
+                    info!("Client heartbeat timeout; closing control connection");
+                    break;
+                }
+            },
+            _ = shutdown.changed() => {
+                info!("Shutting down client handler; draining");
                 break;
             }
         };
@@ -204,26 +255,31 @@ async fn handle_client(
                 let tx = writer_tx.clone();
                 let conns = connections.clone();
                 let r_cipher = cipher.clone();
+                let mut r_shutdown = shutdown.clone();
 
                 tokio::spawn(async move {
                     // 服务端侧 TCP -> 加密控制连接。
-                    // 当远端目标关闭，或控制连接 writer 不可用时，清理连接并通知客户端。
+                    // 当远端目标关闭、控制连接 writer 不可用、或收到关闭信号时，
+                    // 清理连接并通知客户端。
                     let mut reader = read_half;
                     let mut buf = vec![0u8; 32768];
                     loop {
-                        match reader.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let frame = Frame {
-                                    frame_type: FrameType::Data,
-                                    conn_id,
-                                    data: buf[..n].to_vec(),
-                                };
-                                if protocol::send_frame(&tx, &r_cipher, &frame).await.is_err() {
-                                    break;
+                        tokio::select! {
+                            read = reader.read(&mut buf) => match read {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    let frame = Frame {
+                                        frame_type: FrameType::Data,
+                                        conn_id,
+                                        data: buf[..n].to_vec(),
+                                    };
+                                    if protocol::send_frame(&tx, &r_cipher, &frame).await.is_err() {
+                                        break;
+                                    }
                                 }
-                            }
-                            Err(_) => break,
+                                Err(_) => break,
+                            },
+                            _ = r_shutdown.changed() => break,
                         }
                     }
 
@@ -279,14 +335,39 @@ async fn handle_client(
                 let mut conns = connections.lock().await;
                 conns.remove(&frame.conn_id);
             }
+            FrameType::Ping => {
+                // 心跳请求：回 Pong。客户端据此重置其读超时窗口。
+                let pong = Frame {
+                    frame_type: FrameType::Pong,
+                    conn_id: 0,
+                    data: vec![],
+                };
+                let _ = protocol::send_frame(&writer_tx, &cipher, &pong).await;
+            }
+            FrameType::Pong => {
+                // 收到即已重置读超时窗口，无需额外处理。
+            }
             _ => {
                 warn!("Unexpected frame type: 0x{:02x}", frame.frame_type as u8);
             }
         }
     }
 
+    // 收尾。关闭信号触发时各 conn reader 任务也会 break，先发出各自的 CloseConnection
+    // 并释放其 writer_tx 克隆；丢弃这里的 writer_tx 后，writer 任务把通道内积压帧
+    // （含这些 CloseConnection）全部写出再结束，即完成 flush。普通断线则无需等待，直接 abort。
+    let shutting_down = *shutdown.borrow();
     drop(writer_tx);
-    writer_handle.abort();
+    if shutting_down {
+        if tokio::time::timeout(protocol::DRAIN_TIMEOUT, writer_handle)
+            .await
+            .is_err()
+        {
+            warn!("Drain timeout in client handler; some buffered data may be lost");
+        }
+    } else {
+        writer_handle.abort();
+    }
 
     Ok(())
 }

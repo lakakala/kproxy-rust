@@ -7,15 +7,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::crypto;
 use crate::protocol::{self, Frame, FrameType};
 use crate::socks5;
+
+/// 重连退避的初始等待时长。
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// 重连退避的最大等待时长（指数增长到此为止）。
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// 一次会话存活超过此时长即视为"稳定"，断开后把退避重置回 [`RECONNECT_MIN`]，
+/// 避免长时间正常运行后偶发断线却仍从一个很大的退避值开始重连。
+const STABLE_RESET: Duration = Duration::from_secs(60);
 
 /// 活跃本地 TCP 流表，按协议连接 ID 索引。
 ///
@@ -24,11 +34,70 @@ use crate::socks5;
 /// 整条多路复用控制连接。
 type ConnectionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
-/// 连接服务端、注册转发规则，并运行本地监听器。
-pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
-    // 由 token 派生密钥后构造一个可复用的 cipher 实例，整条控制连接共用，
-    // 避免每帧重建 cipher 的 CPU 开销。`Arc` 用于在各 spawn 任务间共享。
+/// 永久运行客户端：建立会话，断开后自动用指数退避重连。
+///
+/// 单次会话的逻辑见 [`run_session`]。本函数只负责重连调度：进程不会因控制
+/// 连接断开而退出，本地监听会随每次重连一并重建。
+pub async fn run(
+    config: &crate::config::ClientConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    // 由 token 派生密钥后构造一个可复用的 cipher 实例，所有会话共用，
+    // 避免每次重连/每帧重建 cipher 的 CPU 开销。`Arc` 用于在各 spawn 任务间共享。
     let cipher = Arc::new(crypto::new_cipher(&crypto::derive_key(&config.token)));
+
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let start = Instant::now();
+        match run_session(config, &cipher, shutdown.clone()).await {
+            Ok(()) => info!("Disconnected from server; will reconnect"),
+            Err(e) => warn!("Session ended: {}; will reconnect", e),
+        }
+
+        // 收到关闭信号则停止重连，干净退出。
+        if *shutdown.borrow() {
+            info!("Client shutting down");
+            break;
+        }
+
+        // 曾稳定存活的会话断开后，从最小退避重新开始，而不是继承一个大退避值。
+        if start.elapsed() >= STABLE_RESET {
+            backoff = RECONNECT_MIN;
+        }
+
+        // 在 [backoff/2, backoff] 区间取一个带抖动的等待时长，避免多客户端同步重连。
+        let delay = {
+            let mut rng = rand::thread_rng();
+            let max_ms = backoff.as_millis() as u64;
+            let min_ms = max_ms / 2;
+            Duration::from_millis(rng.gen_range(min_ms..=max_ms))
+        };
+        info!("Reconnecting in {:.1}s", delay.as_secs_f64());
+        // 退避等待期间也要响应关闭信号，避免关闭时还要干等一整个退避周期。
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => {}
+        }
+        if *shutdown.borrow() {
+            info!("Client shutting down");
+            break;
+        }
+
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+
+    Ok(())
+}
+
+/// 运行一次完整会话：连接服务端、认证、注册转发规则、运行本地监听器，
+/// 并在控制连接断开（或心跳超时）时返回，由 [`run`] 决定是否重连。
+async fn run_session(
+    config: &crate::config::ClientConfig,
+    cipher: &Arc<crypto::Cipher>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    // 取得 cipher 的拥有式句柄，供本会话内各 spawn 任务克隆共享。
+    let cipher = cipher.clone();
 
     let stream = if let Some(socks5_config) = &config.socks5 {
         let (host, port) = parse_host_port(&config.server_addr)?;
@@ -169,10 +238,16 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         let nid = next_conn_id.clone();
         let l_cipher = cipher.clone();
         let l_forward_id = forward_id;
+        let mut l_shutdown = shutdown.clone();
 
         tasks.spawn(async move {
             loop {
-                match listener.accept().await {
+                let accept = tokio::select! {
+                    a = listener.accept() => a,
+                    // 关闭时停止接受新本地连接。
+                    _ = l_shutdown.changed() => break,
+                };
+                match accept {
                     Ok((stream, addr)) => {
                         info!("New connection on forward {}: {}", l_forward_id, addr);
 
@@ -207,29 +282,33 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                         let r_tx = tx.clone();
                         let r_conns = conns.clone();
                         let r_cipher = l_cipher.clone();
+                        let mut c_shutdown = l_shutdown.clone();
 
                         tokio::spawn(async move {
                             // 本地 TCP -> 加密控制连接。
-                            // EOF 或发送失败时关闭本地流，并用关闭帧通知服务端。
+                            // EOF、发送失败或收到关闭信号时关闭本地流，并用关闭帧通知服务端。
                             let mut reader = read_half;
                             let mut buf = vec![0u8; 32768];
                             loop {
-                                match reader.read(&mut buf).await {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        let frame = Frame {
-                                            frame_type: FrameType::Data,
-                                            conn_id,
-                                            data: buf[..n].to_vec(),
-                                        };
-                                        if protocol::send_frame(&r_tx, &r_cipher, &frame)
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
+                                tokio::select! {
+                                    read = reader.read(&mut buf) => match read {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            let frame = Frame {
+                                                frame_type: FrameType::Data,
+                                                conn_id,
+                                                data: buf[..n].to_vec(),
+                                            };
+                                            if protocol::send_frame(&r_tx, &r_cipher, &frame)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
-                                    }
-                                    Err(_) => break,
+                                        Err(_) => break,
+                                    },
+                                    _ = c_shutdown.changed() => break,
                                 }
                             }
 
@@ -255,18 +334,63 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
         });
     }
 
+    // 心跳发送任务：周期性发送 `Ping` 保持连接活跃（穿透 NAT/防火墙空闲超时），
+    // 服务端会回 `Pong`，两端据此重置各自的读超时窗口。writer 队列关闭即退出。
+    let hb_tx = writer_tx.clone();
+    let hb_cipher = cipher.clone();
+    let mut hb_shutdown = shutdown.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(protocol::HEARTBEAT_INTERVAL);
+        // 首个 tick 立即返回，跳过以免连接刚建立就立刻发一个 Ping。
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                // 关闭时退出，释放 writer_tx 克隆，便于 writer 任务尽快结束。
+                _ = hb_shutdown.changed() => break,
+            }
+            let ping = Frame {
+                frame_type: FrameType::Ping,
+                conn_id: 0,
+                data: vec![],
+            };
+            if protocol::send_frame(&hb_tx, &hb_cipher, &ping).await.is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
         // 服务端 -> 客户端的主控制循环。收到的 `Data` 帧会写入本地 socket；
         // 关闭帧会移除本地连接状态。
-        let frame = match protocol::read_frame(&mut reader, &cipher).await {
-            Ok(f) => f,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("unexpected eof") || msg.contains("EOF") || msg.contains("reset") {
-                    info!("Disconnected from server");
-                } else {
-                    error!("Read frame error: {}", e);
+        //
+        // 读操作带超时：任意收到的帧（含 `Pong`）都会重置该窗口；连续多个心跳
+        // 周期都收不到任何帧即判定连接已死，退出会话触发重连。
+        let frame = tokio::select! {
+            read = tokio::time::timeout(
+                protocol::HEARTBEAT_TIMEOUT,
+                protocol::read_frame(&mut reader, &cipher),
+            ) => match read {
+                Ok(Ok(f)) => f,
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    if msg.contains("unexpected eof")
+                        || msg.contains("EOF")
+                        || msg.contains("reset")
+                    {
+                        info!("Disconnected from server");
+                    } else {
+                        error!("Read frame error: {}", e);
+                    }
+                    break;
                 }
+                Err(_) => {
+                    warn!("Server heartbeat timeout; closing control connection");
+                    break;
+                }
+            },
+            _ = shutdown.changed() => {
+                info!("Shutting down session; draining");
                 break;
             }
         };
@@ -310,15 +434,44 @@ pub async fn run(config: &crate::config::ClientConfig) -> anyhow::Result<()> {
                 let mut conns = connections.lock().await;
                 conns.remove(&frame.conn_id);
             }
+            FrameType::Ping => {
+                // 服务端也可能主动探活：回 Pong。
+                let pong = Frame {
+                    frame_type: FrameType::Pong,
+                    conn_id: 0,
+                    data: vec![],
+                };
+                let _ = protocol::send_frame(&writer_tx, &cipher, &pong).await;
+            }
+            FrameType::Pong => {
+                // 收到即已重置读超时窗口，无需额外处理。
+            }
             _ => {
                 warn!("Unexpected frame type: 0x{:02x}", frame.frame_type as u8);
             }
         }
     }
 
-    drop(writer_tx);
-    writer_handle.abort();
+    // 收尾。停止心跳与本地监听后，丢弃这里的 writer_tx。
+    //
+    // 关闭路径：各 conn reader 任务也会因 shutdown 而 break，先发出各自的
+    // CloseConnection 并释放 writer_tx 克隆；待所有克隆释放，writer 任务把通道内
+    // 积压帧（含这些 CloseConnection）全部写出再结束，即完成 flush，有界超时兜底。
+    // 断线重连路径：写侧已不可用，无需等待，直接 abort 以保证重连低延迟。
+    let shutting_down = *shutdown.borrow();
+    heartbeat_handle.abort();
     tasks.abort_all();
+    drop(writer_tx);
+    if shutting_down {
+        if tokio::time::timeout(protocol::DRAIN_TIMEOUT, writer_handle)
+            .await
+            .is_err()
+        {
+            warn!("Drain timeout; some buffered data may be lost");
+        }
+    } else {
+        writer_handle.abort();
+    }
 
     Ok(())
 }
