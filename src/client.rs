@@ -34,22 +34,36 @@ const STABLE_RESET: Duration = Duration::from_secs(60);
 /// 整条多路复用控制连接。
 type ConnectionMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
-/// 永久运行客户端：建立会话，断开后自动用指数退避重连。
-///
-/// 单次会话的逻辑见 [`run_session`]。本函数只负责重连调度：进程不会因控制
-/// 连接断开而退出，本地监听会随每次重连一并重建。
+/// 客户端入口：构造共享 cipher 后按 `connection_mode` 分发到具体运行模式。
 pub async fn run(
     config: &crate::config::ClientConfig,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    // 由 token 派生密钥后构造一个可复用的 cipher 实例，所有会话共用，
+    // 由 token 派生密钥后构造一个可复用的 cipher 实例，所有会话/连接共用，
     // 避免每次重连/每帧重建 cipher 的 CPU 开销。`Arc` 用于在各 spawn 任务间共享。
     let cipher = Arc::new(crypto::new_cipher(&crypto::derive_key(&config.token)));
 
+    match config.connection_mode {
+        crate::config::ConnectionMode::Multiplex => run_multiplex(config, &cipher, shutdown).await,
+        crate::config::ConnectionMode::PerConnection => {
+            run_per_connection(config, &cipher, shutdown).await
+        }
+    }
+}
+
+/// 多路复用模式：建立单条控制连接承载所有流，断开后自动用指数退避重连。
+///
+/// 单次会话的逻辑见 [`run_session`]。本函数只负责重连调度：进程不会因控制
+/// 连接断开而退出，本地监听会随每次重连一并重建。
+async fn run_multiplex(
+    config: &crate::config::ClientConfig,
+    cipher: &Arc<crypto::Cipher>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut backoff = RECONNECT_MIN;
     loop {
         let start = Instant::now();
-        match run_session(config, &cipher, shutdown.clone()).await {
+        match run_session(config, cipher, shutdown.clone()).await {
             Ok(()) => info!("Disconnected from server; will reconnect"),
             Err(e) => warn!("Session ended: {}; will reconnect", e),
         }
@@ -99,25 +113,13 @@ async fn run_session(
     // 取得 cipher 的拥有式句柄，供本会话内各 spawn 任务克隆共享。
     let cipher = cipher.clone();
 
-    let stream = if let Some(socks5_config) = &config.socks5 {
-        let (host, port) = parse_host_port(&config.server_addr)?;
+    if let Some(socks5_config) = &config.socks5 {
         info!(
             "Connecting to server {} via SOCKS5 proxy {}",
             config.server_addr, socks5_config.addr
         );
-        socks5::connect(
-            &socks5_config.addr,
-            &host,
-            port,
-            socks5_config.username.as_deref(),
-            socks5_config.password.as_deref(),
-        )
-        .await?
-    } else {
-        TcpStream::connect(&config.server_addr).await?
-    };
-
-    stream.set_nodelay(true)?;
+    }
+    let stream = connect_to_server(config).await?;
     info!("Connected to server {}", config.server_addr);
 
     let (mut reader, writer) = tokio::io::split(stream);
@@ -473,6 +475,204 @@ async fn run_session(
         writer_handle.abort();
     }
 
+    Ok(())
+}
+
+/// 连接服务端地址，必要时经上游 SOCKS5 代理，并置上 `TCP_NODELAY`。
+///
+/// 两种运行模式共用：多路复用模式每次会话调用一次，每次新建连接模式则
+/// 每条被代理的流调用一次。
+async fn connect_to_server(
+    config: &crate::config::ClientConfig,
+) -> anyhow::Result<TcpStream> {
+    let stream = if let Some(socks5_config) = &config.socks5 {
+        let (host, port) = parse_host_port(&config.server_addr)?;
+        socks5::connect(
+            &socks5_config.addr,
+            &host,
+            port,
+            socks5_config.username.as_deref(),
+            socks5_config.password.as_deref(),
+        )
+        .await?
+    } else {
+        TcpStream::connect(&config.server_addr).await?
+    };
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// 每次新建连接模式：直接按配置绑定本地监听，每个到来的本地连接单独建立一条
+/// 到服务端的 TCP 并双向代理。没有常驻控制连接，因此也没有心跳/注册/重连。
+async fn run_per_connection(
+    config: &crate::config::ClientConfig,
+    cipher: &Arc<crypto::Cipher>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    // 各 accept 循环任务是 'static 的，需要拥有式的配置；克隆一次后用 Arc 共享。
+    let config = Arc::new(config.clone());
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for forward in &config.forwards {
+        let listener = TcpListener::bind(&forward.local_addr).await.map_err(|e| {
+            anyhow::anyhow!("Failed to bind listener on {}: {}", forward.local_addr, e)
+        })?;
+        info!(
+            "Listening on {} -> {} (per-connection)",
+            forward.local_addr, forward.remote_addr
+        );
+
+        let remote_addr = forward.remote_addr.clone();
+        let l_config = config.clone();
+        let l_cipher = cipher.clone();
+        let mut l_shutdown = shutdown.clone();
+
+        tasks.spawn(async move {
+            loop {
+                let accept = tokio::select! {
+                    a = listener.accept() => a,
+                    // 关闭时停止接受新本地连接。
+                    _ = l_shutdown.changed() => break,
+                };
+                match accept {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        info!("New connection -> {}: {}", remote_addr, addr);
+
+                        let s_config = l_config.clone();
+                        let s_cipher = l_cipher.clone();
+                        let s_remote = remote_addr.clone();
+                        let s_shutdown = l_shutdown.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_stream(stream, &s_config, &s_cipher, &s_remote, s_shutdown)
+                                    .await
+                            {
+                                warn!("Stream to {} ended: {}", s_remote, e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Accept error on {}: {}", remote_addr, e);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // 主任务等待关闭信号；收到后中止所有 accept 循环。在途的 per-stream 任务是
+    // 分离的，进程退出时随之结束。
+    let _ = shutdown.changed().await;
+    info!("Client shutting down");
+    tasks.abort_all();
+    Ok(())
+}
+
+/// 处理一条被代理的本地连接（每次新建连接模式）：新开一条到服务端的 TCP，
+/// 认证并发送 `OpenStream` 告知目标远端，随后在本地与服务端之间双向代理。
+async fn handle_stream(
+    local_stream: TcpStream,
+    config: &crate::config::ClientConfig,
+    cipher: &Arc<crypto::Cipher>,
+    remote_addr: &str,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let server = connect_to_server(config).await?;
+    let (mut srv_reader, mut srv_writer) = tokio::io::split(server);
+
+    // 认证。
+    let auth_frame = Frame {
+        frame_type: FrameType::Auth,
+        conn_id: 0,
+        data: config.token.as_bytes().to_vec(),
+    };
+    protocol::write_frame(&mut srv_writer, cipher, &auth_frame).await?;
+
+    let auth_result = protocol::read_frame(&mut srv_reader, cipher).await?;
+    if !matches!(auth_result.frame_type, FrameType::AuthResult) {
+        return Err(anyhow::anyhow!("Expected AuthResult frame"));
+    }
+    let result = String::from_utf8(auth_result.data)?;
+    if result != "ok" {
+        return Err(anyhow::anyhow!("Authentication failed: {}", result));
+    }
+
+    // 告知服务端本流的目标远端。不等待 ack：服务端若连远端失败会直接关闭连接，
+    // 下游读到 EOF 自然结束。
+    let open_frame = Frame {
+        frame_type: FrameType::OpenStream,
+        conn_id: 0,
+        data: remote_addr.as_bytes().to_vec(),
+    };
+    protocol::write_frame(&mut srv_writer, cipher, &open_frame).await?;
+
+    // 专用连接无需 conn_id 区分，固定用 1。
+    const CONN_ID: u32 = 1;
+    let (mut loc_reader, mut loc_writer) = tokio::io::split(local_stream);
+
+    // 本地 -> 服务端：读到的字节封成 Data 帧写往服务端；本地 EOF/出错/关闭时，
+    // 发 CloseConnection 并半关服务端写方向。
+    let up_cipher = cipher.clone();
+    let mut up_shutdown = shutdown.clone();
+    let up = async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            tokio::select! {
+                read = loc_reader.read(&mut buf) => match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frame = Frame {
+                            frame_type: FrameType::Data,
+                            conn_id: CONN_ID,
+                            data: buf[..n].to_vec(),
+                        };
+                        if protocol::write_frame(&mut srv_writer, &up_cipher, &frame)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = up_shutdown.changed() => break,
+            }
+        }
+        let close_frame = Frame {
+            frame_type: FrameType::CloseConnection,
+            conn_id: CONN_ID,
+            data: vec![],
+        };
+        let _ = protocol::write_frame(&mut srv_writer, &up_cipher, &close_frame).await;
+        let _ = srv_writer.shutdown().await;
+    };
+
+    // 服务端 -> 本地：Data 帧写入本地 socket；CloseConnection/EOF/出错时结束。
+    let down_cipher = cipher.clone();
+    let down = async move {
+        loop {
+            tokio::select! {
+                frame = protocol::read_frame(&mut srv_reader, &down_cipher) => match frame {
+                    Ok(f) => match f.frame_type {
+                        FrameType::Data => {
+                            if loc_writer.write_all(&f.data).await.is_err() {
+                                break;
+                            }
+                        }
+                        FrameType::CloseConnection => break,
+                        // 专用连接上不应出现其它帧类型，忽略即可。
+                        _ => {}
+                    },
+                    Err(_) => break,
+                },
+                _ = shutdown.changed() => break,
+            }
+        }
+        let _ = loc_writer.shutdown().await;
+    };
+
+    tokio::join!(up, down);
     Ok(())
 }
 

@@ -85,10 +85,10 @@ async fn handle_client(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
-    let (mut reader, writer) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(writer));
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // 第一帧必须完成客户端认证，认证通过前不接受任何转发状态。
+    // 认证阶段用裸 writer：此时还不需要多路复用所需的写任务/锁。
     let frame = protocol::read_frame(&mut reader, &cipher).await?;
     if !matches!(frame.frame_type, FrameType::Auth) {
         return Err(anyhow::anyhow!("Expected Auth frame"));
@@ -101,8 +101,7 @@ async fn handle_client(
             conn_id: 0,
             data: b"auth failed".to_vec(),
         };
-        let mut w = writer.lock().await;
-        protocol::write_frame(&mut *w, &cipher, &response).await?;
+        protocol::write_frame(&mut writer, &cipher, &response).await?;
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
@@ -113,11 +112,18 @@ async fn handle_client(
         conn_id: 0,
         data: b"ok".to_vec(),
     };
-    {
-        let mut w = writer.lock().await;
-        protocol::write_frame(&mut *w, &cipher, &response).await?;
+    protocol::write_frame(&mut writer, &cipher, &response).await?;
+
+    // 认证后读首帧，据此区分连接类型：
+    // - `OpenStream`：客户端「每次新建连接」模式的专用数据连接，直接双向代理该流。
+    // - 其它：多路复用控制连接，进入下方控制循环（首帧作为循环第一帧处理）。
+    let first = protocol::read_frame(&mut reader, &cipher).await?;
+    if matches!(first.frame_type, FrameType::OpenStream) {
+        return handle_dedicated_stream(reader, writer, first.data, cipher, shutdown).await;
     }
 
+    // 多路复用控制连接：此时才把 writer 包成 `Arc<Mutex>` 并起专用写任务。
+    let writer = Arc::new(Mutex::new(writer));
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     let writer_clone = writer.clone();
@@ -137,39 +143,45 @@ async fn handle_client(
     let mut forward_map: HashMap<u32, String> = HashMap::new();
     let mut forward_id_counter: u32 = 0;
 
+    // 首帧已在分流阶段读出，作为循环的第一帧先处理，之后再从连接读取后续帧。
+    let mut pending = Some(first);
+
     loop {
         // 主控制面循环。这里收到的帧可能修改转发元数据、创建/关闭代理流，
         // 或携带代理流数据。
         // 读超时即视为客户端心跳丢失（连接已死或网络长时间不可达）。任意收到的帧
         // 都会重置该窗口，因此正常心跳流量下不会触发。超时后退出处理任务，由客户端
         // 自行重连建立新会话。
-        let frame = tokio::select! {
-            read = tokio::time::timeout(
-                protocol::HEARTBEAT_TIMEOUT,
-                protocol::read_frame(&mut reader, &cipher),
-            ) => match read {
-                Ok(Ok(f)) => f,
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
-                    if msg.contains("unexpected eof")
-                        || msg.contains("EOF")
-                        || msg.contains("reset")
-                    {
-                        info!("Client disconnected");
-                    } else {
-                        error!("Read frame error: {}", e);
+        let frame = match pending.take() {
+            Some(f) => f,
+            None => tokio::select! {
+                read = tokio::time::timeout(
+                    protocol::HEARTBEAT_TIMEOUT,
+                    protocol::read_frame(&mut reader, &cipher),
+                ) => match read {
+                    Ok(Ok(f)) => f,
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        if msg.contains("unexpected eof")
+                            || msg.contains("EOF")
+                            || msg.contains("reset")
+                        {
+                            info!("Client disconnected");
+                        } else {
+                            error!("Read frame error: {}", e);
+                        }
+                        break;
                     }
-                    break;
-                }
-                Err(_) => {
-                    info!("Client heartbeat timeout; closing control connection");
+                    Err(_) => {
+                        info!("Client heartbeat timeout; closing control connection");
+                        break;
+                    }
+                },
+                _ = shutdown.changed() => {
+                    info!("Shutting down client handler; draining");
                     break;
                 }
             },
-            _ = shutdown.changed() => {
-                info!("Shutting down client handler; draining");
-                break;
-            }
         };
 
         match frame.frame_type {
@@ -369,5 +381,97 @@ async fn handle_client(
         writer_handle.abort();
     }
 
+    Ok(())
+}
+
+/// 处理一条「每次新建连接」模式的专用数据连接。
+///
+/// 该连接只承载单条被代理的流：认证 + `OpenStream` 已在 [`handle_client`] 中完成，
+/// 这里连接客户端指定的远端目标，随后在控制连接（承载加密 `Data` 帧）与远端
+/// 裸 TCP 之间双向代理。远端连接失败则直接返回，drop 关闭控制连接，客户端读到
+/// EOF 自然结束。无心跳超时：空闲流保持打开（标准代理行为）。
+async fn handle_dedicated_stream(
+    mut ctrl_reader: tokio::io::ReadHalf<TcpStream>,
+    mut ctrl_writer: tokio::io::WriteHalf<TcpStream>,
+    remote_addr: Vec<u8>,
+    cipher: Arc<crypto::Cipher>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let remote_addr = String::from_utf8(remote_addr)?;
+    let remote = match TcpStream::connect(&remote_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to connect to {}: {}", remote_addr, e);
+            return Ok(());
+        }
+    };
+    remote.set_nodelay(true)?;
+    info!("Connected to {} (dedicated stream)", remote_addr);
+
+    // 专用连接无需 conn_id 区分，固定用 1。
+    const CONN_ID: u32 = 1;
+    let (mut rem_reader, mut rem_writer) = tokio::io::split(remote);
+
+    // 控制连接 -> 远端：`Data` 帧写入远端；`CloseConnection`/EOF/出错时结束。
+    let in_cipher = cipher.clone();
+    let mut in_shutdown = shutdown.clone();
+    let inbound = async move {
+        loop {
+            tokio::select! {
+                frame = protocol::read_frame(&mut ctrl_reader, &in_cipher) => match frame {
+                    Ok(f) => match f.frame_type {
+                        FrameType::Data => {
+                            if rem_writer.write_all(&f.data).await.is_err() {
+                                break;
+                            }
+                        }
+                        FrameType::CloseConnection => break,
+                        // 专用连接上不应出现其它帧类型，忽略即可。
+                        _ => {}
+                    },
+                    Err(_) => break,
+                },
+                _ = in_shutdown.changed() => break,
+            }
+        }
+        let _ = rem_writer.shutdown().await;
+    };
+
+    // 远端 -> 控制连接：远端字节封成 `Data` 帧；远端 EOF/出错时发 `CloseConnection`。
+    let out_cipher = cipher.clone();
+    let outbound = async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            tokio::select! {
+                read = rem_reader.read(&mut buf) => match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frame = Frame {
+                            frame_type: FrameType::Data,
+                            conn_id: CONN_ID,
+                            data: buf[..n].to_vec(),
+                        };
+                        if protocol::write_frame(&mut ctrl_writer, &out_cipher, &frame)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = shutdown.changed() => break,
+            }
+        }
+        let close_frame = Frame {
+            frame_type: FrameType::CloseConnection,
+            conn_id: CONN_ID,
+            data: vec![],
+        };
+        let _ = protocol::write_frame(&mut ctrl_writer, &out_cipher, &close_frame).await;
+        let _ = ctrl_writer.shutdown().await;
+    };
+
+    tokio::join!(inbound, outbound);
     Ok(())
 }

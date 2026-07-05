@@ -6,6 +6,18 @@
 
 use serde::Deserialize;
 
+/// 客户端与服务端之间承载被代理数据的底层连接方式。
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    /// 所有被代理的流复用到同一条加密控制连接上（默认，保持向后兼容）。
+    #[default]
+    Multiplex,
+    /// 每个被代理的流单独建立一条到服务端的 TCP 连接，互不影响；
+    /// 不保留常驻控制连接，也没有心跳/注册/重连。
+    PerConnection,
+}
+
 /// 从 `server.toml` 加载的服务端配置。
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
@@ -16,7 +28,7 @@ pub struct ServerConfig {
 }
 
 /// 从 `client.toml` 加载的客户端配置。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClientConfig {
     /// 共享密钥 token，必须与服务端 token 一致。
     pub token: String,
@@ -26,10 +38,13 @@ pub struct ClientConfig {
     pub forwards: Vec<ForwardConfig>,
     /// 访问 `server_addr` 时可选的上游 SOCKS5 代理。
     pub socks5: Option<Socks5Config>,
+    /// 底层连接方式。省略时默认为 [`ConnectionMode::Multiplex`]。
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
 }
 
 /// 客户端控制连接可选的 SOCKS5 代理设置。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Socks5Config {
     /// SOCKS5 代理 TCP 地址。
     pub addr: String,
@@ -43,7 +58,7 @@ pub struct Socks5Config {
 ///
 /// `local_addr` 由客户端监听。当本地连接到达后，服务端连接
 /// `remote_addr`，随后两端之间开始代理数据。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ForwardConfig {
     /// 客户端侧监听地址，例如 `127.0.0.1:8080`。
     pub local_addr: String,

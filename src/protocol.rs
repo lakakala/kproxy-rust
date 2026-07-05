@@ -66,6 +66,10 @@ pub enum FrameType {
     Ping = 0x08,
     /// 控制连接心跳应答（`conn_id == 0`，无负载）。
     Pong = 0x09,
+    /// 客户端 -> 服务端，「每次新建连接」模式下单流数据连接认证成功后的第一帧，
+    /// 负载为目标远端地址（UTF-8）。服务端据此把该连接识别为专用数据连接，
+    /// 连接远端后在此连接上双向代理。多路复用客户端永不发送此帧。
+    OpenStream = 0x0a,
 }
 
 impl FrameType {
@@ -80,6 +84,7 @@ impl FrameType {
             0x07 => Some(FrameType::CloseConnection),
             0x08 => Some(FrameType::Ping),
             0x09 => Some(FrameType::Pong),
+            0x0a => Some(FrameType::OpenStream),
             _ => None,
         }
     }
